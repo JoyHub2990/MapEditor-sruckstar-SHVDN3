@@ -189,7 +189,18 @@ namespace MapEditor
             // BELOW ONLY WHEN MAP EDITOR IS ACTIVE
             //
 
-            if (!IsInFreecam) return;
+            if (!IsInFreecam)
+            {
+                // A tick late on purpose: the freecam hands the player back down into the interior it was
+                // holding (see ReturnPlayerToGround), and letting go of them in the same frame would be letting
+                // go before the game has had a chance to notice anyone is standing in one.
+                ReleaseHeldInteriors();
+                return;
+            }
+
+            // Before anything that can end the tick early, so that the interiors around the camera are held
+            // open just the same while the object picker is up over them.
+            HoldInteriorsAroundCamera();
 
             Function.Call(Hash.DISABLE_CONTROL_ACTION, 0, (int)Control.CharacterWheel);
 			Function.Call(Hash.DISABLE_CONTROL_ACTION, 0, (int)Control.SelectWeapon);

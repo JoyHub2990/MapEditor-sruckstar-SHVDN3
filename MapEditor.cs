@@ -80,6 +80,22 @@ namespace MapEditor
         /// </summary>
         private Vector3 _freecamEntryPosition;
 
+        /// <summary>
+        /// Every interior the freecam has found around itself so far, each mapped to the spot it was found at.
+        /// All of them are pinned in memory and switched on again on every frame, and they are held until the
+        /// freecam goes down. Empty while the freecam is not up. See <see cref="HoldInteriorsAroundCamera"/>.
+        /// </summary>
+        private readonly Dictionary<int, Vector3> _heldInteriors = new Dictionary<int, Vector3>();
+
+        /// <summary>
+        /// The spot the scan pass in progress is being run around: where the camera was when it started, not
+        /// where the camera is now. See <see cref="HoldInteriorsAroundCamera"/>.
+        /// </summary>
+        private Vector3 _interiorScanOrigin;
+
+        /// <summary>How far into <see cref="InteriorScanOffsets"/> the pass in progress has got.</summary>
+        private int _interiorScanCursor;
+
         private readonly Vector3 _objectPreviewPos = new Vector3(1200.133f, 4000.958f, 85.9f);
 
         private bool _zAxis = true;
@@ -455,6 +471,11 @@ namespace MapEditor
                 _objectPreviewCamera = null;
             }
 
+            // Whatever the freecam was holding in memory goes back to the game. Outside the block above because
+            // the freecam can have been switched off already, in the same frame the script went down, before the
+            // tick that would have released it ever ran.
+            ReleaseHeldInteriors();
+
             // These come back from their own files on the next start, so anything left standing here is spawned
             // a second time on top of itself.
             AutoloadedMaps.UnloadAll();
@@ -548,6 +569,206 @@ namespace MapEditor
             Function.Call(Hash.SET_ENTITY_LOAD_COLLISION_FLAG, player.Handle, true);
 
             player.Position = target;
+        }
+
+        /// <summary>How far out around the camera the close-up half of the scan reaches, and how finely it is
+        /// walked. Fine enough to catch a room the size of a shop, and to tell one floor of a tower from the
+        /// one above it, which is what the vertical step is for: floors are barely three metres apart.</summary>
+        private const float InteriorNearRadius = 25f;
+        private const float InteriorNearHeight = 24f;
+        private const float InteriorNearStep = 4f;
+        private const float InteriorNearStepZ = 3f;
+
+        /// <summary>How far out the wide half of the scan reaches, walked coarsely because it is there to find
+        /// whole buildings before the camera arrives at them, not to resolve small rooms inside them. Anything
+        /// it misses is picked up by the fine half as the camera comes closer.</summary>
+        private const float InteriorFarRadius = 90f;
+        private const float InteriorFarHeight = 48f;
+        private const float InteriorFarStep = 12f;
+        private const float InteriorFarStepZ = 6f;
+
+        /// <summary>Points looked at per frame. The whole grid is some thousands of them, so a pass takes about
+        /// half a second at sixty frames, spread thin enough not to be felt.</summary>
+        private const int InteriorScanSamplesPerTick = 192;
+
+        /// <summary>How far the camera has to fly before the grid is walked again around where it now is.</summary>
+        private const float InteriorRescanDistance = 10f;
+
+        /// <summary>How far behind the camera a held interior has to be left before it is given back to the
+        /// game. See <see cref="ForgetDistantInteriors"/>.</summary>
+        private const float InteriorForgetDistance = 400f;
+
+        /// <summary>
+        /// The offsets from the camera that <see cref="HoldInteriorsAroundCamera"/> looks for interiors at,
+        /// nearest first so that a pass cut short has still covered everything close by.
+        ///
+        /// Two cylinders of points, one fine and one coarse, both taller than a building is high — an interior
+        /// is only ever found by asking about a point inside it, so anything the grid steps over is an interior
+        /// that is not found. Built once, since it is the same relative grid wherever the camera happens to be.
+        /// </summary>
+        private static readonly Vector3[] InteriorScanOffsets = BuildInteriorScanOffsets();
+
+        private static Vector3[] BuildInteriorScanOffsets()
+        {
+            var offsets = new List<Vector3>();
+
+            AddInteriorScanPoints(offsets, InteriorNearRadius, InteriorNearHeight, InteriorNearStep, InteriorNearStepZ, 0f, 0f);
+            AddInteriorScanPoints(offsets, InteriorFarRadius, InteriorFarHeight, InteriorFarStep, InteriorFarStepZ,
+                InteriorNearRadius, InteriorNearHeight);
+
+            offsets.Sort((a, b) => a.LengthSquared().CompareTo(b.LengthSquared()));
+            return offsets.ToArray();
+        }
+
+        /// <summary>
+        /// Fills a cylinder of <paramref name="radius"/> and half-height <paramref name="height"/> around the
+        /// origin with points <paramref name="step"/> apart, leaving out the ones already covered by a finer
+        /// cylinder of <paramref name="skipRadius"/> and <paramref name="skipHeight"/>.
+        /// </summary>
+        private static void AddInteriorScanPoints(List<Vector3> offsets, float radius, float height, float step,
+            float stepZ, float skipRadius, float skipHeight)
+        {
+            // Counted out in whole steps from the middle rather than walked from one edge to the other, so that
+            // the grid is centred on the camera however the radius and the step divide.
+            var acrossSteps = (int)(radius / step);
+            var upSteps = (int)(height / stepZ);
+
+            for (var ix = -acrossSteps; ix <= acrossSteps; ix++)
+            for (var iy = -acrossSteps; iy <= acrossSteps; iy++)
+            {
+                var x = ix * step;
+                var y = iy * step;
+
+                // A circle rather than the square the two loops walk: the corners of the square lie half again
+                // as far out as the radius asked for, for a third more points and no more building.
+                var distanceSq = x * x + y * y;
+                if (distanceSq > radius * radius) continue;
+
+                var skipColumn = distanceSq <= skipRadius * skipRadius;
+
+                for (var iz = -upSteps; iz <= upSteps; iz++)
+                {
+                    var z = iz * stepZ;
+                    if (skipColumn && Math.Abs(z) <= skipHeight) continue;
+
+                    offsets.Add(new Vector3(x, y, z));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Keeps every interior around the freecam loaded and drawn, for as long as the freecam is up.
+        ///
+        /// The game works out which interior to stream and to draw from where the player is, and the player is
+        /// not where the camera is: freelook parks them eight metres behind it (see
+        /// <see cref="ProcessFreelook"/>) and drags them along frozen. Take the camera out through a wall — or
+        /// merely up to one, since eight metres is thicker than most of them — and the player is carried out of
+        /// the interior's bounds with it, which the game reads as having left: the interior is deactivated and
+        /// streamed out, and from the inside the room is an empty shell. Flying back in does not bring it back
+        /// either, because the player is being teleported rather than walked in through a door, and it is the
+        /// walking in that would otherwise ask for it again.
+        ///
+        /// Holding only the one interior the camera is standing in is not enough, because what looks like one
+        /// building is not one interior: a tower is a stack of them, one per floor, side rooms and stairwells
+        /// beside them, and the game hands out exactly one at a time. Flying up through the ceiling would then
+        /// mean giving up the floor below to get the floor above, and the shell of the building is all that is
+        /// left of everywhere the camera is not — which is the thing this is here to stop.
+        ///
+        /// So the whole neighbourhood is asked for instead. <see cref="InteriorScanOffsets"/> is walked as a
+        /// grid of points around the camera, above and below it as much as around it, and every interior found
+        /// at any of them is pinned in memory — which is what stops the streamer from dropping it — and set
+        /// active on every frame, which is what undoes the player being dragged out of it. Nothing is given up
+        /// on the way back out into the world: what is found is held until the freecam goes down (bar
+        /// <see cref="ForgetDistantInteriors"/>, which only lets go of what the camera has left far behind), so
+        /// a building worked in and out of over and over is still there on every way back in.
+        ///
+        /// The grid is far too large to walk in one frame, so a pass is spread over as many frames as it takes
+        /// at <see cref="InteriorScanSamplesPerTick"/> points each — a fraction of a second — and offsets are
+        /// ordered nearest first so that wherever the camera itself is comes back on the first frame of it.
+        /// </summary>
+        private void HoldInteriorsAroundCamera()
+        {
+            var cameraPos = _mainCamera.Position;
+
+            // A pass starts over from where the camera is now once the last one has run out of points, or once
+            // the camera has flown far enough that the pass in progress is being run around a spot it has long
+            // since left. Nothing is lost by cutting one short: the offsets it had left are the far ones, and
+            // the near ones it had already covered are the ones that matter.
+            if (_interiorScanCursor >= InteriorScanOffsets.Length ||
+                (cameraPos - _interiorScanOrigin).Length() > InteriorRescanDistance)
+            {
+                ForgetDistantInteriors(cameraPos);
+                _interiorScanOrigin = cameraPos;
+                _interiorScanCursor = 0;
+            }
+
+            var passEnd = Math.Min(_interiorScanCursor + InteriorScanSamplesPerTick, InteriorScanOffsets.Length);
+            for (; _interiorScanCursor < passEnd; _interiorScanCursor++)
+            {
+                var at = _interiorScanOrigin + InteriorScanOffsets[_interiorScanCursor];
+
+                // Answered from the map data rather than from what is in memory, so the answer does not depend
+                // on the interior being loaded at the time of asking. Which is the whole point of scanning
+                // ahead: nearly everything this finds is not loaded yet, and is being asked for so that it is.
+                var interior = Function.Call<int>(Hash.GET_INTERIOR_AT_COORDS, at.X, at.Y, at.Z);
+                if (interior == 0 || _heldInteriors.ContainsKey(interior)) continue;
+
+                Function.Call(Hash.PIN_INTERIOR_IN_MEMORY, interior);
+                _heldInteriors.Add(interior, at);
+            }
+
+            // Every frame and for every one of them, because the player being dragged around eight metres
+            // behind the camera keeps wandering out through the walls of whichever interior they were last in,
+            // and the game reads each of those as having left and switches that interior off.
+            foreach (var interior in _heldInteriors.Keys)
+                Function.Call(Hash.SET_INTERIOR_ACTIVE, interior, true);
+        }
+
+        /// <summary>
+        /// Lets go of the interiors the camera has left more than <see cref="InteriorForgetDistance"/> behind.
+        ///
+        /// Held interiors are held whole — geometry, collision and props — and a long session flying across the
+        /// map would otherwise go on stacking up every building passed through, in memory, until the freecam
+        /// went down. That distance is far outside anything a camera can see out of, and far outside the scan
+        /// radius, so nothing is dropped that flying back would not simply find and pin again within a pass.
+        /// </summary>
+        private void ForgetDistantInteriors(Vector3 cameraPos)
+        {
+            List<int> distant = null;
+
+            foreach (var held in _heldInteriors)
+            {
+                if ((held.Value - cameraPos).Length() <= InteriorForgetDistance) continue;
+                (distant ?? (distant = new List<int>())).Add(held.Key);
+            }
+
+            if (distant == null) return;
+
+            foreach (var interior in distant)
+            {
+                Function.Call(Hash.UNPIN_INTERIOR, interior);
+                _heldInteriors.Remove(interior);
+            }
+        }
+
+        /// <summary>
+        /// Hands everything <see cref="HoldInteriorsAroundCamera"/> is holding back to the game, which is then
+        /// free to stream each of them out again once nothing is left inside it. Safe to call on any tick: it
+        /// does nothing unless there are interiors being held.
+        /// </summary>
+        private void ReleaseHeldInteriors()
+        {
+            if (_heldInteriors.Count == 0) return;
+
+            foreach (var interior in _heldInteriors.Keys)
+                Function.Call(Hash.UNPIN_INTERIOR, interior);
+
+            _heldInteriors.Clear();
+
+            // The next freecam session starts its own pass, around wherever it goes up, rather than carrying on
+            // through the leftovers of this one.
+            _interiorScanCursor = 0;
+            _interiorScanOrigin = Vector3.Zero;
         }
 
         /// <summary>
