@@ -13,7 +13,6 @@ namespace MapEditor
         public static string CurrentTranslation { get; set; }
 
         private static TranslationRoot _currenTranslationFile;
-        private static List<StringPair> _stringList;
 
         public static void Load(string folder, string translation)
         {

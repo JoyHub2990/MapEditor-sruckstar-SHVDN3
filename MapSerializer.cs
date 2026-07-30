@@ -177,7 +177,6 @@ namespace MapEditor
                         }
                         return tmpMap;
                     }
-			        break;
 				default:
 					throw new NotImplementedException("This is not implemented yet.");
 			}
