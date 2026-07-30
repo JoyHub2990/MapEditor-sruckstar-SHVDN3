@@ -72,6 +72,14 @@ namespace MapEditor
         private Camera _mainCamera;
         private Camera _objectPreviewCamera;
 
+        /// <summary>
+        /// Where the player was standing when the freecam went up. Kept as the last place to put them back
+        /// down when the freecam is switched off over somewhere there is no ground to be found at all: it is
+        /// the one spot they are known to have been standing on solid footing. See
+        /// <see cref="ReturnPlayerToGround"/>.
+        /// </summary>
+        private Vector3 _freecamEntryPosition;
+
         private readonly Vector3 _objectPreviewPos = new Vector3(1200.133f, 4000.958f, 85.9f);
 
         private bool _zAxis = true;
@@ -432,15 +440,19 @@ namespace MapEditor
             if (IsInFreecam)
             {
                 IsInFreecam = false;
-                World.RenderingCamera = null;
-                World.DestroyAllCameras();
-                _mainCamera = null;
-                _objectPreviewCamera = null;
 
                 var player = Game.Player.Character;
                 player.IsPositionFrozen = false;
                 player.IsVisible = true;
-                player.Position -= new Vector3(0f, 0f, player.HeightAboveGround - 1f);
+
+                // Before the cameras go: it works out where to put the player down from where the freecam was
+                // left, so it needs the camera to still be there.
+                ReturnPlayerToGround();
+
+                World.RenderingCamera = null;
+                World.DestroyAllCameras();
+                _mainCamera = null;
+                _objectPreviewCamera = null;
             }
 
             // These come back from their own files on the next start, so anything left standing here is spawned
@@ -465,13 +477,100 @@ namespace MapEditor
             World.RenderingCamera = null;
             if (!IsInFreecam)
             {
-                Game.Player.Character.Position -= new Vector3(0f, 0f, Game.Player.Character.HeightAboveGround - 1f);
+                ReturnPlayerToGround();
                 return;
             }
+            // Taken before the first tick of freelook moves the player out from under the camera, so it is
+            // still the spot they were standing on rather than one the camera dragged them to.
+            _freecamEntryPosition = Game.Player.Character.Position;
+
             World.DestroyAllCameras();
             _mainCamera = World.CreateCamera(GameplayCamera.Position, VectorExtensions.ClampCameraRotation(GameplayCamera.Rotation), 60f);
             _objectPreviewCamera = World.CreateCamera(new Vector3(1200.016f, 3980.998f, 86.05062f), new Vector3(0f, 0f, 0f), 60f);
             World.RenderingCamera = _mainCamera;
+        }
+
+        /// <summary>
+        /// Sets the player down on the ground under the freecam when it hands them back.
+        ///
+        /// The camera is what the spot is worked out from, not the player's own position, because the two are
+        /// not in the same place: while the freecam is up the player is parked eight metres behind it (see
+        /// <see cref="ProcessFreelook"/>) and left frozen there. Out in the open those eight metres are open
+        /// air, but in an interior they are usually through a wall or under the floor — outside the shell of
+        /// the building, in the empty space the interior sits in, with nothing under them for a very long way.
+        /// Put back from there the player falls out of the world, while the camera position is a spot in the
+        /// room they were actually working in.
+        ///
+        /// The drop itself is a probe straight down rather than the height the game reports above ground
+        /// (GET_ENTITY_HEIGHT_ABOVE_GROUND, behind <see cref="Entity.HeightAboveGround"/>), which is measured
+        /// against the world's own ground and does not see interior floors: in an interior it answers with the
+        /// drop to the terrain under the whole building, which again puts the player underneath the floor they
+        /// were standing on. A probe hits interior floors, and placed props and vehicles with them.
+        ///
+        /// If neither probe finds anything, the player goes back to <see cref="_freecamEntryPosition"/>: the
+        /// spot the freecam was switched on from, and the last one they are known to have been standing on
+        /// solid ground at.
+        /// </summary>
+        private void ReturnPlayerToGround()
+        {
+            var player = Game.Player.Character;
+            var playerPos = player.Position;
+            var hasCamera = _mainCamera != null && _mainCamera.Exists();
+
+            Vector3? landing = null;
+
+            if (hasCamera)
+            {
+                var cameraPos = _mainCamera.Position;
+                var ground = GroundBelow(cameraPos, player);
+                if (ground.HasValue) landing = new Vector3(cameraPos.X, cameraPos.Y, ground.Value + 1f);
+            }
+
+            if (!landing.HasValue)
+            {
+                // Nothing under the camera — it was left over a hole in the map, or off the edge of it. The
+                // player's own spot is the next best thing. Started a little above them so that a floor they
+                // are level with, or slightly sunk into, is in front of the probe rather than behind it.
+                var ground = GroundBelow(playerPos + new Vector3(0f, 0f, 0.5f), player);
+                if (ground.HasValue) landing = new Vector3(playerPos.X, playerPos.Y, ground.Value + 1f);
+            }
+
+            // Nowhere to be found on the ground at all: back where they came in, exactly. Nothing is probed
+            // for there — it is a spot they were already standing on, and the point of it is that it is the
+            // one place left that is known to be good. Zero means it was never taken, the freecam having gone
+            // up some way other than ToggleFreecam, and then there is nothing better than where they are.
+            var entry = _freecamEntryPosition != Vector3.Zero ? _freecamEntryPosition : playerPos;
+            var target = landing ?? entry;
+
+            // The camera can have carried the player a long way from where they started, so the ground they
+            // are being given back to may not be in memory yet. The flag holds them up until it is.
+            Function.Call(Hash.REQUEST_COLLISION_AT_COORD, target.X, target.Y, target.Z);
+            Function.Call(Hash.SET_ENTITY_LOAD_COLLISION_FLAG, player.Handle, true);
+
+            player.Position = target;
+        }
+
+        /// <summary>
+        /// The height of the first solid thing under <paramref name="from"/>, or null when the probe comes
+        /// back with nothing.
+        ///
+        /// The probe is the synchronous kind on purpose. The ordinary one is a request the game answers a
+        /// frame or more later, which is fine for the placement raycasts that run on every tick and useless
+        /// here: this is asked once, and an answer of "not ready yet" would read as "nothing below" and leave
+        /// the player hanging in the air at random.
+        /// </summary>
+        private static float? GroundBelow(Vector3 from, Entity toIgnore)
+        {
+            const float probeLength = 1000f;
+
+            var probe = ShapeTest.StartExpensiveSyncTestLOSProbe(from, from - new Vector3(0f, 0f, probeLength),
+                IntersectFlags.Map | IntersectFlags.Objects | IntersectFlags.Vehicles, toIgnore,
+                ShapeTestOptions.Default);
+
+            ShapeTestResult result;
+            if (probe.GetResult(out result) != ShapeTestStatus.Ready || !result.DidHit) return null;
+
+            return result.HitPosition.Z;
         }
 
         private void NewMap()
