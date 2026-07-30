@@ -469,7 +469,7 @@ namespace MapEditor
                 return;
             }
             World.DestroyAllCameras();
-            _mainCamera = World.CreateCamera(GameplayCamera.Position, GameplayCamera.Rotation, 60f);
+            _mainCamera = World.CreateCamera(GameplayCamera.Position, VectorExtensions.ClampCameraRotation(GameplayCamera.Rotation), 60f);
             _objectPreviewCamera = World.CreateCamera(new Vector3(1200.016f, 3980.998f, 86.05062f), new Vector3(0f, 0f, 0f), 60f);
             World.RenderingCamera = _mainCamera;
         }

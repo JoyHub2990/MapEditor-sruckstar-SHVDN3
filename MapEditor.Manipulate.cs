@@ -17,7 +17,8 @@ namespace MapEditor
         private void ProcessFreelook(Entity hitEnt, float mouseX, float mouseY, float movementModifier, float modifier)
         {
             if (!_menuPool.AreAnyVisible || Game.LastInputMethod == InputMethod.GamePad)
-                _mainCamera.Rotation = new Vector3(_mainCamera.Rotation.X + mouseY, _mainCamera.Rotation.Y, _mainCamera.Rotation.Z + mouseX);
+                _mainCamera.Rotation = VectorExtensions.ClampCameraRotation(
+                    new Vector3(_mainCamera.Rotation.X + mouseY, _mainCamera.Rotation.Y, _mainCamera.Rotation.Z + mouseX));
 
             var dir = VectorExtensions.RotationToDirection(_mainCamera.Rotation);
             var rotLeft = _mainCamera.Rotation + new Vector3(0, 0, -10);

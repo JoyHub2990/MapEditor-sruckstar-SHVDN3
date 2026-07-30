@@ -7,6 +7,28 @@ namespace MapEditor
 {
     public static class VectorExtensions
     {
+        /// <summary>
+        /// How far up or down the camera may look. Straight up and straight down are left out on purpose:
+        /// at exactly 90 degrees the heading of the camera stops being defined.
+        /// </summary>
+        private const float MaxCameraPitch = 89f;
+
+        /// <summary>
+        /// Keeps a camera rotation in the range the game accepts. Pitched past vertical, the game flips the
+        /// camera over instead: it mirrors the pitch back under 90 degrees and hands back 180 degrees of roll.
+        /// That roll is what knocks the camera off its axis, and it sticks because it gets read back in on
+        /// every following frame.
+        /// </summary>
+        public static Vector3 ClampCameraRotation(Vector3 rotation)
+        {
+            var pitch = rotation.X;
+            if (pitch > MaxCameraPitch) pitch = MaxCameraPitch;
+            else if (pitch < -MaxCameraPitch) pitch = -MaxCameraPitch;
+
+            // Roll goes to zero: freelook never rolls on its own, so anything left in there is the flip above.
+            return new Vector3(pitch, 0f, (float)BoundRotationDeg(rotation.Z));
+        }
+
         public static float Denormalize(this float h)
         {
             return h < 0f ? h + 360f : h;
