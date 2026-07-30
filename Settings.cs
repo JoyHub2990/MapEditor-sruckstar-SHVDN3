@@ -22,6 +22,7 @@ namespace MapEditor
 	        Translation = "Auto";
 	        OmitInvalidObjects = true;
 	        WorldObjectNames = false;
+	        StreamingRange = SmartStreaming.DefaultRange;
 	    }
 
 	    public string Translation;
@@ -43,5 +44,11 @@ namespace MapEditor
 
 	    /// <summary>Names the game's own objects where they stand, so they can be copied or starred by sight.</summary>
 	    public bool WorldObjectNames;
+
+	    /// <summary>
+	    /// How far from the player a placed entity may be before it is taken out of the world until they come
+	    /// back to it, in metres, or <see cref="SmartStreaming.Off"/> to keep every map in the world whole.
+	    /// </summary>
+	    public int StreamingRange;
 	}
 }

@@ -9,7 +9,13 @@ using GTA.Native;
 namespace MapEditor
 {
 	/// <summary>
-	/// Only create the first 200 objects that are in proximity to the player.
+	/// The map being edited: everything in it, everything the editor keeps beside it, and the spawning and
+	/// deleting of it.
+	///
+	/// The lists below hold what is standing in the world at this moment, keyed by entity handle, and
+	/// <see cref="StreamedOut"/> holds the rest of the map — the part <see cref="SmartStreaming"/> has taken
+	/// out of the world because the player is nowhere near it. Both halves are the map: the counts, what gets
+	/// saved and the entity menu all cover the two together.
 	/// </summary>
 	public static class PropStreamer
 	{
@@ -43,15 +49,59 @@ namespace MapEditor
 
 		public static List<int> ActiveSirens = new List<int>();
 
-		public static int PropCount => StreamedInHandles.Count + MemoryObjects.Count;
-
-		public static int EntityCount => StreamedInHandles.Count + MemoryObjects.Count + Vehicles.Count + Peds.Count;
-
 		public static List<MapObject> RemovedObjects = new List<MapObject>();
 
 	    public static MapMetadata CurrentMapMetadata = new MapMetadata();
-        
-        public static Prop CreateProp(Model model, Vector3 position, Vector3 rotation, bool dynamic, Quaternion q = null, bool force = false, int drawDistance = -1)
+
+		/// <summary>
+		/// One entity of the map being edited that <see cref="SmartStreaming"/> has taken back out of the world
+		/// because the player left it behind. It is still part of the map in every way that matters — it is
+		/// counted, it is saved, and it still has its row in the entity menu — it is simply not standing
+		/// anywhere at the moment.
+		/// </summary>
+		public sealed class StreamedObject
+		{
+			/// <summary>Everything needed to put it back, in the same shape the map file holds it in.</summary>
+			public MapObject Object;
+
+			/// <summary>
+			/// What its entity menu row points at while there is no entity handle to point at. Handles are
+			/// handed back to the game when the entity goes and are given out again to whatever the game
+			/// spawns next, so the row cannot simply keep the old one.
+			/// </summary>
+			public int Uid;
+		}
+
+		public static List<StreamedObject> StreamedOut = new List<StreamedObject>();
+
+		private static int _streamUids;
+
+		public static int PropCount => StreamedInHandles.Count + MemoryObjects.Count + StreamedOutCount(ObjectTypes.Prop);
+
+		public static int VehicleCount => Vehicles.Count + StreamedOutCount(ObjectTypes.Vehicle);
+
+		public static int PedCount => Peds.Count + StreamedOutCount(ObjectTypes.Ped);
+
+		public static int EntityCount => PropCount + VehicleCount + PedCount;
+
+		/// <summary>
+		/// Whether the world is holding as many props as it may. Streaming asks before spawning, because a map
+		/// with more props than the limit is perfectly workable as long as no more than the limit are in range
+		/// at once, and trying anyway would tell the player they had reached the limit on every frame.
+		/// </summary>
+		public static bool PropSlotsFull => StreamedInHandles.Count >= MAX_OBJECTS;
+
+		private static int StreamedOutCount(ObjectTypes type)
+		{
+			var count = 0;
+			foreach (var streamed in StreamedOut)
+			{
+				if (streamed.Object.Type == type) count++;
+			}
+			return count;
+		}
+
+        public static Prop CreateProp(Model model, Vector3 position, Vector3 rotation, bool dynamic, Quaternion q = null, bool force = false, int drawDistance = -1, bool pace = true)
 		{
 			if (StreamedInHandles.Count >= MAX_OBJECTS)
 			{
@@ -59,7 +109,12 @@ namespace MapEditor
 				return null;
 			}
 
-            if (PropCount > 0 && PropCount % 249 == 0)
+			// A breather every so often while a whole map is being poured into the world in one go. Counted on
+			// what is actually standing, not on the size of the map: with smart streaming most of a large map
+			// is not in the world, and counting that would have this waiting on every single prop for as long
+			// as the total sat on a multiple. Streaming itself passes pace: false — it already spreads its
+			// spawning over frames, and a hundred milliseconds lost in the middle of one is a visible stutter.
+			if (pace && StreamedInHandles.Count > 0 && StreamedInHandles.Count % 249 == 0)
                 Script.Wait(100);
 
 			var prop = Compat.PropFrom(Function.Call<int>(Hash.CREATE_OBJECT_NO_OFFSET, model.Hash, position.X, position.Y, position.Z, true, true, dynamic));
@@ -119,6 +174,11 @@ namespace MapEditor
 		public static Ped CreatePed(Model model, Vector3 position, float heading, bool dynamic, Quaternion q = null, int drawDistance = -1)
 		{
 			var veh = World.CreatePed(model, position, heading);
+			if (veh == null)
+			{
+				Compat.Notify("~r~~h~Map Editor~h~~w~~n~The ped failed to spawn.");
+				return null;
+			}
 			Peds.Add(veh.Handle);
 			if (!dynamic)
 			{
@@ -218,6 +278,7 @@ namespace MapEditor
 		    }
 			if (Vehicles.Contains(handle)) Vehicles.Remove(handle);
 			if (StaticProps.Contains(handle)) StaticProps.Remove(handle);
+			Anchors.Remove(handle);
 		}
 
 		public static void RemovePed(int handle)
@@ -230,6 +291,7 @@ namespace MapEditor
 		    }
 			if (Peds.Contains(handle)) Peds.Remove(handle);
 			if (StaticProps.Contains(handle)) StaticProps.Remove(handle);
+			Anchors.Remove(handle);
         }
 
 		/// <summary>
@@ -282,6 +344,7 @@ namespace MapEditor
 	        if (Peds.Contains(handle)) Peds.Remove(handle);
 			if (Vehicles.Contains(handle)) Vehicles.Remove(handle);
 			if (StreamedInHandles.Contains(handle)) StreamedInHandles.Remove(handle);
+			Anchors.Remove(handle);
 		}
 
 		internal static void AddProp(Prop prop, bool dynamic)
@@ -310,6 +373,9 @@ namespace MapEditor
 			StreamedInHandles.ForEach(i => Compat.Ent(i)?.Delete());
 			StreamedInHandles.Clear();
 			MemoryObjects.Clear();
+			// Nothing to delete for these: they are the part of the map that is not in the world.
+			StreamedOut.Clear();
+			Anchors.Clear();
 			StaticProps.Clear();
 			Vehicles.ForEach(v => Compat.Ent(v)?.Delete());
 			Peds.ForEach(v => Compat.Ent(v)?.Delete());
@@ -319,68 +385,223 @@ namespace MapEditor
             Pickups.Clear();
 		}
 
+		/// <summary>
+		/// The difference between the spot an entity was spawned to stand at and the spot it then says it is
+		/// standing at.
+		///
+		/// The two are not always the same. A ped is spawned by its feet and answers about its middle, and the
+		/// metre between the two is only exactly a metre for a grown human — a child, a dog or a bird answers
+		/// from somewhere slightly else. Write down what it answers and spawn it from that again and it moves
+		/// by that difference every time, so an afternoon of flying out to a map and back would slowly bury it
+		/// in the ground or leave it hovering. The same goes, more coarsely, for anything spawned in the air
+		/// that comes to rest a little lower than it was put.
+		///
+		/// So the difference is measured once, when the entity is put into the world, and taken back off
+		/// whenever the map is read out of the world again. It is a property of the model rather than of the
+		/// placement, which is why it can be taken off wherever the entity has got to since: an entity the
+		/// player has moved is written down at its new spot, corrected the same way.
+		/// </summary>
+		private static readonly Dictionary<int, Vector3> Anchors = new Dictionary<int, Vector3>();
+
+		/// <summary>
+		/// How far the game may be seen to move something on the way in before the measurement is written off
+		/// as something other than the offset this is here to undo, and ignored. Nothing legitimate is out by
+		/// more than the metre a ped is spawned by.
+		/// </summary>
+		private const float MaxAnchorCorrection = 2f;
+
+		/// <summary>
+		/// Takes an object into the map without putting it into the world, for a map loaded from a file with
+		/// most of itself somewhere the player is not. It is part of the map from this moment — counted, saved,
+		/// and listed in the entity menu — and streaming spawns it when the player goes to it.
+		/// </summary>
+		public static StreamedObject AddStreamedOut(MapObject o)
+		{
+			var record = new StreamedObject { Object = o, Uid = _streamUids++ };
+			StreamedOut.Add(record);
+			return record;
+		}
+
+		/// <summary>
+		/// Takes one entity of the map out of the world, keeping everything needed to put it back. The map is
+		/// no shorter for it: the snapshot stands in for the entity in the count, in what gets saved, and in
+		/// the entity menu, until <see cref="StreamedIn"/> hands the map back a real one.
+		/// </summary>
+		public static StreamedObject StreamOut(Entity entity)
+		{
+			if (entity == null) return null;
+
+			var handle = entity.Handle;
+			var snapshot = Snapshot(handle);
+			if (snapshot == null) return null;
+
+			var record = AddStreamedOut(snapshot);
+
+			// Everything these were holding for this entity has just been written into the snapshot, and the
+			// handle they are keyed by is about to be handed back to the game and given out to something else.
+			Identifications.Remove(handle);
+			ActiveScenarios.Remove(handle);
+			ActiveRelationships.Remove(handle);
+			ActiveWeapons.Remove(handle);
+			Doors.Remove(handle);
+			ActiveSirens.Remove(handle);
+			StaticProps.Remove(handle);
+			StreamedInHandles.Remove(handle);
+			Vehicles.Remove(handle);
+			Peds.Remove(handle);
+			Anchors.Remove(handle);
+
+			ReleaseModel(entity.Model);
+			entity.Delete();
+			return record;
+		}
+
+		/// <summary>
+		/// Hands the map back the entity <paramref name="record"/> stood in for. The caller has already spawned
+		/// it and registered whatever the snapshot said about it; this is the record being retired.
+		/// </summary>
+		public static void StreamedIn(StreamedObject record, Entity entity)
+		{
+			StreamedOut.Remove(record);
+			if (entity == null) return;
+
+			Anchor(entity, record.Object.Position);
+		}
+
+		/// <summary>
+		/// Writes down what the game did to <paramref name="asked"/> on the way in, so that reading the entity
+		/// back out gives the spot it was asked to stand at rather than the spot it answers from. See
+		/// <see cref="Anchors"/>.
+		/// </summary>
+		public static void Anchor(Entity entity, Vector3 asked)
+		{
+			if (entity == null) return;
+
+			var correction = entity.Position - asked;
+			if (correction.Length() > MaxAnchorCorrection)
+			{
+				Anchors.Remove(entity.Handle);
+				return;
+			}
+
+			Anchors[entity.Handle] = correction;
+		}
+
+		/// <summary>The map object one entity of the map would be saved as, or null if it is no longer there.</summary>
+		public static MapObject Snapshot(int handle)
+		{
+			if (Vehicles.Contains(handle)) return SnapshotVehicle(handle);
+			if (Peds.Contains(handle)) return SnapshotPed(handle);
+			return SnapshotProp(handle);
+		}
+
+		private static MapObject SnapshotProp(int handle)
+		{
+			var prop = Compat.Ent(handle);
+			if (prop == null) return null;
+
+			var snapshot = new MapObject()
+			{
+				Dynamic = !StaticProps.Contains(handle),
+				Hash = prop.Model.Hash,
+				Position = prop.Position,
+				Quaternion = Quaternion.GetEntityQuaternion(prop),
+				Rotation = prop.Rotation,
+				Type = ObjectTypes.Prop,
+				Door = Doors.Contains(handle),
+				Id = (Identifications.ContainsKey(handle) && !string.IsNullOrWhiteSpace(Identifications[handle])) ? Identifications[handle] : null,
+			};
+
+			ApplyAnchor(handle, snapshot);
+			return snapshot;
+		}
+
+		private static MapObject SnapshotVehicle(int handle)
+		{
+			var veh = Compat.VehicleFrom(handle);
+			if (veh == null) return null;
+
+			var snapshot = new MapObject()
+			{
+				Dynamic = !StaticProps.Contains(handle),
+				Hash = veh.Model.Hash,
+				Position = veh.Position,
+				Quaternion = Quaternion.GetEntityQuaternion(veh),
+				Rotation = veh.Rotation,
+				Type = ObjectTypes.Vehicle,
+				Id = (Identifications.ContainsKey(handle) && !string.IsNullOrWhiteSpace(Identifications[handle])) ? Identifications[handle] : null,
+				SirensActive = ActiveSirens.Contains(handle),
+				PrimaryColor = (int)veh.Mods.PrimaryColor,
+				SecondaryColor = (int)veh.Mods.SecondaryColor,
+				Livery = veh.Mods.Livery,
+			};
+
+			ApplyAnchor(handle, snapshot);
+			return snapshot;
+		}
+
+		private static MapObject SnapshotPed(int handle)
+		{
+			var ped = Compat.PedFrom(handle);
+			if (ped == null) return null;
+
+			var snapshot = new MapObject()
+			{
+				Dynamic = !StaticProps.Contains(handle),
+				Hash = ped.Model.Hash,
+				Position = ped.Position,
+				Quaternion = Quaternion.GetEntityQuaternion(ped),
+				Rotation = ped.Rotation,
+				Type = ObjectTypes.Ped,
+				Action = ActiveScenarios.ContainsKey(handle) ? ActiveScenarios[handle] : "None",
+				Id = (Identifications.ContainsKey(handle) && !string.IsNullOrWhiteSpace(Identifications[handle])) ? Identifications[handle] : null,
+				Relationship = ActiveRelationships.ContainsKey(handle) ? ActiveRelationships[handle] : null,
+				Weapon = ActiveWeapons.ContainsKey(handle) ? ActiveWeapons[handle] : (WeaponHash?)null,
+				Drawables = PedComponents.ReadDrawables(ped),
+				Textures = PedComponents.ReadTextures(ped),
+			};
+
+			ApplyAnchor(handle, snapshot);
+			return snapshot;
+		}
+
+		/// <summary>Takes the offset measured on the way in back off the position. See <see cref="Anchors"/>.</summary>
+		private static void ApplyAnchor(int handle, MapObject snapshot)
+		{
+			Vector3 correction;
+			if (!Anchors.TryGetValue(handle, out correction)) return;
+
+			snapshot.Position -= correction;
+		}
+
 		public static MapObject[] GetAllEntities()
 		{
 			var outList = new List<MapObject>();
 
 			foreach (int handle in StreamedInHandles)
 			{
-				var prop = Compat.Ent(handle);
-				if (prop == null) continue;
-				outList.Add(new MapObject()
-				{
-					Dynamic = !StaticProps.Contains(handle),
-					Hash = prop.Model.Hash,
-					Position = prop.Position,
-					Quaternion = Quaternion.GetEntityQuaternion(prop),
-					Rotation = prop.Rotation,
-					Type = ObjectTypes.Prop,
-					Door = Doors.Contains(handle),
-					Id = (Identifications.ContainsKey(handle) && !string.IsNullOrWhiteSpace(Identifications[handle])) ? Identifications[handle] : null,
-				});
+				var snapshot = SnapshotProp(handle);
+				if (snapshot != null) outList.Add(snapshot);
 			}
 
 			outList.AddRange(MemoryObjects);
 
+			// The map is saved whole whether or not all of it happens to be standing at the moment. What was
+			// streamed out is written from the snapshot taken on the way out, which is the same snapshot the
+			// entity itself would have been written from.
+			foreach (var streamed in StreamedOut)
+				outList.Add(streamed.Object);
+
 			foreach (int v in Vehicles)
 			{
-				var veh = Compat.VehicleFrom(v);
-				if (veh == null) continue;
-				outList.Add(new MapObject()
-				{
-					Dynamic = !StaticProps.Contains(v),
-					Hash = veh.Model.Hash,
-					Position = veh.Position,
-					Quaternion = Quaternion.GetEntityQuaternion(veh),
-					Rotation = veh.Rotation,
-					Type = ObjectTypes.Vehicle,
-					Id = (Identifications.ContainsKey(v) && !string.IsNullOrWhiteSpace(Identifications[v])) ? Identifications[v] : null,
-					SirensActive = ActiveSirens.Contains(v),
-					PrimaryColor = (int)veh.Mods.PrimaryColor,
-					SecondaryColor = (int)veh.Mods.SecondaryColor,
-					Livery = veh.Mods.Livery,
-				});
+				var snapshot = SnapshotVehicle(v);
+				if (snapshot != null) outList.Add(snapshot);
 			}
 
 			foreach (int v in Peds)
 			{
-				var ped = Compat.PedFrom(v);
-				if (ped == null) continue;
-				outList.Add(new MapObject()
-				{
-					Dynamic = !StaticProps.Contains(v),
-					Hash = ped.Model.Hash,
-					Position = ped.Position,
-					Quaternion = Quaternion.GetEntityQuaternion(ped),
-					Rotation = ped.Rotation,
-					Type = ObjectTypes.Ped,
-					Action = ActiveScenarios.ContainsKey(v) ? ActiveScenarios[v] : "None",
-					Id = (Identifications.ContainsKey(v) && !string.IsNullOrWhiteSpace(Identifications[v])) ? Identifications[v] : null,
-					Relationship = ActiveRelationships.ContainsKey(v) ? ActiveRelationships[v] : null,
-					Weapon = ActiveWeapons.ContainsKey(v) ? ActiveWeapons[v] : (WeaponHash?)null,
-					Drawables = PedComponents.ReadDrawables(ped),
-					Textures = PedComponents.ReadTextures(ped),
-				});
+				var snapshot = SnapshotPed(v);
+				if (snapshot != null) outList.Add(snapshot);
 			}
 
 			foreach (DynamicPickup p in Pickups)

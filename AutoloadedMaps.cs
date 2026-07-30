@@ -25,6 +25,36 @@ namespace MapEditor
 		private const string LegacyFolder = "scripts\\AutoloadMaps";
 
 		/// <summary>
+		/// One prop, vehicle or ped of an autoloaded map, and the entity standing for it at the moment — which
+		/// is nothing at all while the player is far enough away that <see cref="SmartStreaming"/> has taken it
+		/// out of the world.
+		///
+		/// It is always put back from the map object it was read out of the file as, never from a fresh reading
+		/// of the entity that was there. An autoloaded map is scenery nobody is editing and nobody is going to
+		/// save, so there is nothing to be gained by letting a hundred trips past it walk it away from what its
+		/// file says it is.
+		/// </summary>
+		private sealed class LoadedEntity
+		{
+			public LoadedEntity(MapObject o)
+			{
+				Object = o;
+			}
+
+			public readonly MapObject Object;
+
+			/// <summary>Null while it is not in the world, which is not the same as <see cref="Gone"/>.</summary>
+			public Entity Entity;
+
+			/// <summary>
+			/// Set once the entity turns out to have been deleted by somebody else. These are spawned
+			/// persistent, so the game cannot have done it, and streaming it back in would be arguing with
+			/// whoever did.
+			/// </summary>
+			public bool Gone;
+		}
+
+		/// <summary>
 		/// What one autoloaded map put into the world. Kept per map rather than in one shared pile so that a
 		/// single map can be taken back out while the others stay standing.
 		/// </summary>
@@ -37,7 +67,7 @@ namespace MapEditor
 
 			public string Name { get; }
 
-			public readonly List<Entity> Entities = new List<Entity>();
+			public readonly List<LoadedEntity> Entities = new List<LoadedEntity>();
 			public readonly List<int> Pickups = new List<int>();
 			public readonly List<Marker> Markers = new List<Marker>();
 			public readonly List<MapObject> RemovedObjects = new List<MapObject>();
@@ -49,6 +79,10 @@ namespace MapEditor
 
 		public static int MapCount => Maps.Count;
 
+		/// <summary>
+		/// Everything the loaded maps are made of, whether or not it happens to be in the world right now: a
+		/// count that fell as the player drove away would be answering a question nobody asked.
+		/// </summary>
 		public static int EntityCount => Maps.Sum(m => m.Entities.Count + m.Pickups.Count);
 
 		public static bool Any => Maps.Count > 0;
@@ -140,7 +174,26 @@ namespace MapEditor
 
 			foreach (var o in map.Objects)
 			{
-				if (o != null) Spawn(o, loaded);
+				if (o == null) continue;
+
+				// A pickup is named by a pickup hash, not a model hash, and the game keeps it as a pickup
+				// rather than as an entity. It has a range of its own and is left to it.
+				if (o.Type == ObjectTypes.Pickup)
+				{
+					var pickup = Function.Call<int>(Hash.CREATE_PICKUP_ROTATE, o.Hash, o.Position.X, o.Position.Y,
+						o.Position.Z, 0f, 0f, o.Rotation.Z, 515, o.Amount, 0, false, 0);
+					if (pickup != 0) loaded.Pickups.Add(pickup);
+					continue;
+				}
+
+				var entry = new LoadedEntity(o);
+				loaded.Entities.Add(entry);
+
+				// Only the part of the map the player is anywhere near goes into the world now. The rest is
+				// put in by <see cref="StreamEntities"/> as they reach it, which is what makes a map far
+				// larger than the world will hold cost nothing until it is walked into.
+				if (SmartStreaming.HasReturned(o.Position))
+					entry.Entity = Spawn(o);
 			}
 
 			foreach (var o in map.RemoveFromWorld)
@@ -154,20 +207,19 @@ namespace MapEditor
 			}
 		}
 
-		private static void Spawn(MapObject o, LoadedMap map)
+		/// <summary>
+		/// Puts one object of an autoloaded map into the world, and hands back what it put there.
+		///
+		/// <paramref name="streaming"/> says nobody is waiting for it: it is scenery filling in behind a player
+		/// who is walking towards it, so a model that is not in memory yet is asked for and the whole thing is
+		/// left for a later frame rather than blocking on it with "Loading Model" on the screen.
+		/// </summary>
+		private static Entity Spawn(MapObject o, bool streaming = false)
 		{
-			// A pickup is named by a pickup hash, not a model hash. Handing that to the model loader would send
-			// it looking for a model that does not exist and blacklist the hash on the way out.
-			if (o.Type == ObjectTypes.Pickup)
-			{
-				var pickup = Function.Call<int>(Hash.CREATE_PICKUP_ROTATE, o.Hash, o.Position.X, o.Position.Y,
-					o.Position.Z, 0f, 0f, o.Rotation.Z, 515, o.Amount, 0, false, 0);
-				if (pickup != 0) map.Pickups.Add(pickup);
-				return;
-			}
+			var model = streaming ? SmartStreaming.RequestModel(o.Hash) : ObjectPreview.LoadObject(o.Hash);
+			if (model == null) return null;
 
-			var model = ObjectPreview.LoadObject(o.Hash);
-			if (model == null) return;
+			Entity spawned = null;
 
 			switch (o.Type)
 			{
@@ -182,7 +234,7 @@ namespace MapEditor
 
 					prop.PositionNoOffset = o.Position;
 					prop.IsPositionFrozen = !o.Dynamic && !o.Door;
-					Track(prop, map);
+					spawned = prop;
 					break;
 				}
 				case ObjectTypes.Vehicle:
@@ -199,7 +251,7 @@ namespace MapEditor
 					}
 					vehicle.IsSirenActive = o.SirensActive;
 					vehicle.IsPositionFrozen = !o.Dynamic;
-					Track(vehicle, map);
+					spawned = vehicle;
 					break;
 				}
 				case ObjectTypes.Ped:
@@ -218,12 +270,18 @@ namespace MapEditor
 						ObjectDatabase.SetPedRelationshipGroup(ped, o.Relationship);
 
 					StartScenario(ped, o.Action);
-					Track(ped, map);
+					spawned = ped;
 					break;
 				}
 			}
 
+			// Persistence is what stops the game from streaming the map out again the moment the player walks
+			// away. Which is exactly what smart streaming then does instead, deliberately and reversibly, on
+			// its own terms — the game's streamer would take a map out and never put it back.
+			if (spawned != null) spawned.IsPersistent = true;
+
 			model.MarkAsNoLongerNeeded();
+			return spawned;
 		}
 
 		/// <summary>A quaternion that was never written to the map file, as opposed to a real rotation.</summary>
@@ -257,15 +315,6 @@ namespace MapEditor
 				Function.Call(Hash.TASK_START_SCENARIO_IN_PLACE, ped.Handle, scenario, 0, 0);
 		}
 
-		/// <summary>
-		/// Persistence is what stops the game from streaming the map out again the moment the player walks away.
-		/// </summary>
-		private static void Track(Entity entity, LoadedMap map)
-		{
-			entity.IsPersistent = true;
-			map.Entities.Add(entity);
-		}
-
 		/// <summary>Every marker still standing, from whichever maps are still loaded.</summary>
 		private static IEnumerable<Marker> AllMarkers => Maps.SelectMany(m => m.Markers);
 
@@ -273,13 +322,15 @@ namespace MapEditor
 		{
 			if (Maps.Count == 0) return;
 
+			StreamEntities();
+
 			foreach (var map in Maps)
 			{
 				foreach (var o in map.RemovedObjects)
 				{
 					var prop = World.GetClosestProp(o.Position, 1f, new Model(o.Hash));
 					// A prop another autoloaded map spawned here is not the world prop this one wants gone.
-					if (prop == null || !prop.Exists() || Maps.Any(m => m.Entities.Contains(prop))) continue;
+					if (prop == null || !prop.Exists() || IsOurs(prop)) continue;
 					prop.Delete();
 				}
 			}
@@ -294,6 +345,89 @@ namespace MapEditor
 			}
 
 			TickTeleports();
+		}
+
+		/// <summary>Whether an entity is one of ours, from any of the loaded maps.</summary>
+		private static bool IsOurs(Entity entity)
+		{
+			return Maps.Any(m => m.Entities.Any(e => e.Entity != null && e.Entity.Handle == entity.Handle));
+		}
+
+		/// <summary>How far through the loaded maps the rolling scan has got. See <see cref="StreamEntities"/>.</summary>
+		private static int _scanCursor;
+
+		/// <summary>
+		/// Keeps the loaded maps down to the parts of them the player is anywhere near, the same way the editor
+		/// does it for the map being edited. See <see cref="SmartStreaming"/>.
+		///
+		/// Autoloaded maps are the reason the setting is worth having at all: they are loaded whole at startup
+		/// and stand there for the rest of the session, wherever the player goes, and there can be any number
+		/// of them. Walked a slice at a time across frames, because asking every entity of every map where it
+		/// is, on every frame, is the cost this is meant to be saving.
+		/// </summary>
+		private static void StreamEntities()
+		{
+			var total = 0;
+			foreach (var map in Maps)
+				total += map.Entities.Count;
+
+			if (total == 0) return;
+
+			var toScan = Math.Min(total, SmartStreaming.ScanPerTick);
+			for (var i = 0; i < toScan; i++)
+			{
+				if (_scanCursor >= total) _scanCursor = 0;
+
+				var entry = EntryAt(_scanCursor++);
+				if (entry == null || entry.Gone) continue;
+
+				// With the setting off there is nothing to ask about something that is already standing, and
+				// asking anyway would be spending every frame on exactly the cost the player turned off.
+				if (entry.Entity != null && !SmartStreaming.Enabled) continue;
+
+				if (entry.Entity == null)
+				{
+					if (!SmartStreaming.HasReturned(entry.Object.Position)) continue;
+					if (!SmartStreaming.TakeSpawn()) return;
+
+					// A spawn that comes back empty-handed has asked for its model and will be tried again on
+					// a later pass, once the game has it.
+					entry.Entity = Spawn(entry.Object, streaming: true);
+					continue;
+				}
+
+				if (!entry.Entity.Exists())
+				{
+					// Deleted by the player or by another mod: these are persistent, so the game did not do it.
+					entry.Entity = null;
+					entry.Gone = true;
+					continue;
+				}
+
+				if (!SmartStreaming.IsTooFar(entry.Entity.Position)) continue;
+
+				// Only reachable while the freecam is down, since distance is measured from the camera while
+				// it is up and the player is dragged along behind it.
+				var vehicle = Game.Player.Character.CurrentVehicle;
+				if (vehicle != null && vehicle.Handle == entry.Entity.Handle) continue;
+
+				if (!SmartStreaming.TakeDespawn()) return;
+
+				entry.Entity.Delete();
+				entry.Entity = null;
+			}
+		}
+
+		/// <summary>The entities of every loaded map as one list, for the rolling scan to walk.</summary>
+		private static LoadedEntity EntryAt(int index)
+		{
+			foreach (var map in Maps)
+			{
+				if (index < map.Entities.Count) return map.Entities[index];
+				index -= map.Entities.Count;
+			}
+
+			return null;
 		}
 
 		private static void TickTeleports()
@@ -354,10 +488,11 @@ namespace MapEditor
 		/// </summary>
 		private static void Remove(LoadedMap map)
 		{
-			foreach (var entity in map.Entities)
+			foreach (var entry in map.Entities)
 			{
-				if (entity != null && entity.Exists())
-					entity.Delete();
+				// Nothing to delete for the ones streaming has already taken out of the world.
+				if (entry.Entity != null && entry.Entity.Exists())
+					entry.Entity.Delete();
 			}
 
 			foreach (var pickup in map.Pickups)

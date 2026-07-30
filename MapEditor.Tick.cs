@@ -109,6 +109,10 @@ namespace MapEditor
 
 		public void OnTick(object sender, EventArgs e)
 		{
+			// Before anything that spawns or places anything, including the first-tick load below: every map
+			// that goes into the world this frame is streamed against the same spot.
+			SmartStreaming.BeginTick(CurrentStreamingOrigin);
+
 			// The maps flagged for autoloading, plus anything left in the legacy "AutoloadMaps" folder, and then
 			// the map the player was editing when the script last went down, if it went down with one open.
 			if (!_hasLoaded)
@@ -120,6 +124,7 @@ namespace MapEditor
 			_menuPool.Process();
 			PropStreamer.Tick();
 			AutoloadedMaps.Tick();
+			ProcessSmartStreaming();
 			WarmObjectRows();
 
 			if (PropStreamer.EntityCount > 0 || PropStreamer.RemovedObjects.Count > 0 || PropStreamer.Markers.Count > 0 || PropStreamer.Pickups.Count > 0)
@@ -543,9 +548,12 @@ namespace MapEditor
             Row(5, Translation.Translate("PICKUPS"), PropStreamer.Pickups.Count.ToString());
             Row(4, Translation.Translate("MARKERS"), PropStreamer.Markers.Count.ToString());
             Row(3, Translation.Translate("WORLD"), PropStreamer.RemovedObjects.Count.ToString());
+            // The map's own count, not the world's: what smart streaming has taken out of the world is still
+            // part of the map, and a counter that fell as the player flew away would be reporting the wrong
+            // thing entirely.
             Row(2, Translation.Translate("PROPS"), PropStreamer.PropCount.ToString());
-            Row(1, Translation.Translate("VEHICLES"), PropStreamer.Vehicles.Count.ToString());
-            Row(0, Translation.Translate("PEDS"), PropStreamer.Peds.Count.ToString());
+            Row(1, Translation.Translate("VEHICLES"), PropStreamer.VehicleCount.ToString());
+            Row(0, Translation.Translate("PEDS"), PropStreamer.PedCount.ToString());
         }
 
         private void DrawEntityBox(Entity ent, Color color)

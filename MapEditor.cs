@@ -991,6 +991,10 @@ namespace MapEditor
 		            _settings.DrawDistance = -1;
 		        if (!_settings.BoundingBox.HasValue)
 		            _settings.BoundingBox = true;
+		        // Zero is what a settings file written before there was a streaming range deserializes to, and
+		        // it is not a range anyone can have picked: switching it off is SmartStreaming.Off.
+		        if (_settings.StreamingRange == 0)
+		            _settings.StreamingRange = SmartStreaming.DefaultRange;
 		    }
 		    else
 		    {
@@ -999,6 +1003,7 @@ namespace MapEditor
 		    }
 
 		    ObjectDatabase.TrackInvalidObjects = _settings.OmitInvalidObjects;
+		    SmartStreaming.Range = _settings.StreamingRange;
 	    }
 
 	    private void SaveSettings()
@@ -1096,115 +1101,48 @@ namespace MapEditor
 		        {
 		            Game.Player.Character.Position = map2Load.Metadata.LoadingPoint.Value;
                     Wait(500);
+
+                    // The player is somewhere else now, and what of the map is worth putting into the world is
+                    // measured from where they are, not from where they were when the frame started.
+                    SmartStreaming.BeginTick(CurrentStreamingOrigin);
 		        }
 
 			    foreach (MapObject o in map2Load.Objects)
 			    {
 				    if(o == null) continue;
 			        _loadedEntities++;
-				    switch (o.Type)
-				    {
-					    case ObjectTypes.Prop:
-				            var newProp = PropStreamer.CreateProp(ObjectPreview.LoadObject(o.Hash), o.Position, o.Rotation,
-				                o.Dynamic && !o.Door, o.Quaternion == new Quaternion() {X = 0, Y = 0, Z = 0, W = 0} ? null : o.Quaternion,
-				                drawDistance: _settings.DrawDistance);
-                            AddItemToEntityMenu(newProp);
 
-				            if (o.Door)
-				            {
-				                PropStreamer.Doors.Add(newProp.Handle);
-				                newProp.IsPositionFrozen = false;
-				            }
+                    if (o.Type == ObjectTypes.Pickup)
+                    {
+                        var newPickup = PropStreamer.CreatePickup(o.Hash, o.Position, o.Rotation.Z, o.Amount, o.Dynamic, o.Quaternion);
+                        newPickup.Timeout = o.RespawnTimer;
+                        AddItemToEntityMenu(newPickup);
+                        if (o.Id != null && !PropStreamer.Identifications.ContainsKey(newPickup.ObjectHandle))
+                        {
+                            PropStreamer.Identifications.Add(newPickup.ObjectHandle, o.Id);
+                            handles.Add(newPickup.ObjectHandle);
+                        }
+                        continue;
+                    }
 
-				            if (o.Id != null && !PropStreamer.Identifications.ContainsKey(newProp.Handle))
-				            {
-				                PropStreamer.Identifications.Add(newProp.Handle, o.Id);
-                                handles.Add(newProp.Handle);
-				            }
-						    break;
-					    case ObjectTypes.Vehicle:
-						    Vehicle tmpVeh;
-						    AddItemToEntityMenu(tmpVeh = PropStreamer.CreateVehicle(ObjectPreview.LoadObject(o.Hash), o.Position, o.Rotation.Z, o.Dynamic, drawDistance: _settings.DrawDistance));
-				            tmpVeh.Mods.PrimaryColor = (VehicleColor) o.PrimaryColor;
-                            tmpVeh.Mods.SecondaryColor = (VehicleColor)o.SecondaryColor;
-				            if (o.Livery >= 0)
-				            {
-				                Function.Call(Hash.SET_VEHICLE_MOD_KIT, tmpVeh.Handle, 0);
-				                tmpVeh.Mods.Livery = o.Livery;
-				            }
-                            if (o.Id != null && !PropStreamer.Identifications.ContainsKey(tmpVeh.Handle))
-				            {
-				                PropStreamer.Identifications.Add(tmpVeh.Handle, o.Id);
-				                handles.Add(tmpVeh.Handle);
-				            }
-                            if (o.SirensActive)
-						    {
-							    PropStreamer.ActiveSirens.Add(tmpVeh.Handle);
-							    tmpVeh.IsSirenActive = true;
-						    }
-						    break;
-					    case ObjectTypes.Ped:
-						    Ped pedid;
-						    AddItemToEntityMenu(pedid = PropStreamer.CreatePed(ObjectPreview.LoadObject(o.Hash), o.Position - new Vector3(0f, 0f, 1f), o.Rotation.Z, o.Dynamic, drawDistance: _settings.DrawDistance));
-						    PedComponents.Apply(pedid, o.Drawables, o.Textures);
-							if((o.Action == null || o.Action == "None") && !PropStreamer.ActiveScenarios.ContainsKey(pedid.Handle))
-								PropStreamer.ActiveScenarios.Add(pedid.Handle, "None");
-							else if (o.Action != null && o.Action != "None" && !PropStreamer.ActiveScenarios.ContainsKey(pedid.Handle))
-							{
-								PropStreamer.ActiveScenarios.Add(pedid.Handle, o.Action);
-								if (o.Action == "Any" || o.Action == "Any - Walk")
-									Function.Call(Hash.TASK_USE_NEAREST_SCENARIO_TO_COORD, pedid.Handle, pedid.Position.X, pedid.Position.Y,
-										pedid.Position.Z, 100f, -1);
-								else if(o.Action == "Any - Warp")
-									Function.Call(Hash.TASK_USE_NEAREST_SCENARIO_TO_COORD_WARP, pedid.Handle, pedid.Position.X, pedid.Position.Y,
-											pedid.Position.Z, 100f, -1);
-                                else if (o.Action == "Wander")
-                                    pedid.Task.WanderAround();
-								else
-								{
-									Function.Call(Hash.TASK_START_SCENARIO_IN_PLACE, pedid.Handle, ObjectDatabase.ScrenarioDatabase[o.Action], 0, 0);
-								}
-							}
+                    // The far side of a large map is loaded without ever being put into the world: it is in the
+                    // map, in the entity menu and in what gets saved, and streaming spawns it if and when the
+                    // player goes there. An object with a name is spawned wherever it is, because the map's
+                    // script is about to be handed it and cannot be handed one that is not there.
+                    if (o.Id == null && !SmartStreaming.HasReturned(o.Position))
+                    {
+                        AddStreamedItemToEntityMenu(o, PropStreamer.AddStreamedOut(o).Uid);
+                        continue;
+                    }
 
-				            if (o.Id != null && !PropStreamer.Identifications.ContainsKey(pedid.Handle))
-				            {
-				                PropStreamer.Identifications.Add(pedid.Handle, o.Id);
-				                handles.Add(pedid.Handle);
-				            }
+                    // The same spawn smart streaming uses to put an entity back after the player has been away
+                    // from it, so that a map that has been flown out of and back into is still the map that was
+                    // loaded. See <see cref="SpawnMapObject"/>.
+                    var entity = SpawnMapObject(o);
+                    if (entity == null) continue;
 
-                            if (o.Relationship == null)
-							    PropStreamer.ActiveRelationships.Add(pedid.Handle, DefaultRelationship.ToString());
-						    else
-						    {
-							    PropStreamer.ActiveRelationships.Add(pedid.Handle, o.Relationship);
-							    if (o.Relationship != DefaultRelationship.ToString())
-							    {
-								    ObjectDatabase.SetPedRelationshipGroup(pedid, o.Relationship);
-							    }
-						    }
-
-						    if (o.Weapon == null)
-							    PropStreamer.ActiveWeapons.Add(pedid.Handle, WeaponHash.Unarmed);
-						    else
-						    {
-							    PropStreamer.ActiveWeapons.Add(pedid.Handle, o.Weapon.Value);
-							    if (o.Weapon != WeaponHash.Unarmed)
-							    {
-								    pedid.Weapons.Give(o.Weapon.Value, 999, true, true);
-							    }
-						    }
-						    break;
-                        case ObjectTypes.Pickup:
-				            var newPickup = PropStreamer.CreatePickup(o.Hash, o.Position, o.Rotation.Z, o.Amount, o.Dynamic, o.Quaternion);
-				            newPickup.Timeout = o.RespawnTimer;
-                            AddItemToEntityMenu(newPickup);
-                            if (o.Id != null && !PropStreamer.Identifications.ContainsKey(newPickup.ObjectHandle))
-                            {
-                                PropStreamer.Identifications.Add(newPickup.ObjectHandle, o.Id);
-                                handles.Add(newPickup.ObjectHandle);
-                            }
-                            break;
-				    }
+                    AddItemToEntityMenu(entity);
+                    if (o.Id != null) handles.Add(entity.Handle);
 			    }
 			    foreach (MapObject o in map2Load.RemoveFromWorld)
 			    {

@@ -30,6 +30,13 @@ namespace MapEditor
             World,
             Marker,
             Pickup,
+
+            /// <summary>
+            /// An entity of the map that is not in the world at the moment, because the player is nowhere near
+            /// it. Its row is the same row it had while it was standing, pointed at the record smart streaming
+            /// is holding it in rather than at a handle the game has taken back.
+            /// </summary>
+            Streamed,
         }
 
         /// <summary>
@@ -197,6 +204,32 @@ namespace MapEditor
                 SaveSettings();
             };
 
+            var streamingRanges = new List<string> { disableText };
+            for (int i = 100; i <= 1000; i += 100)
+                streamingRanges.Add(i.ToString(CultureInfo.InvariantCulture));
+            streamingRanges.Add("1500");
+            streamingRanges.Add("2000");
+            streamingRanges.Add("3000");
+
+            int sIndex = streamingRanges.IndexOf(_settings.StreamingRange.ToString(CultureInfo.InvariantCulture));
+            if (sIndex == -1) sIndex = streamingRanges.IndexOf(SmartStreaming.DefaultRange.ToString(CultureInfo.InvariantCulture));
+
+            var streamingItem = new NativeListItem<string>(Translation.Translate("Streaming Range"),
+                Translation.Translate("How far away a placed prop, vehicle or ped is unloaded from the world, in metres." +
+                                      " It comes back when you return. Applies to the map you are building and to autoloaded maps."),
+                streamingRanges.ToArray())
+            {
+                SelectedIndex = ClampIndex(sIndex, streamingRanges.Count),
+            };
+            streamingItem.ItemChanged += (sender, e) =>
+            {
+                _settings.StreamingRange = e.Object == disableText
+                    ? SmartStreaming.Off
+                    : Convert.ToInt32(e.Object, CultureInfo.InvariantCulture);
+                SmartStreaming.Range = _settings.StreamingRange;
+                SaveSettings();
+            };
+
             var senslist = Enumerable.Range(1, 59).ToArray();
 
             var gamboy = new NativeListItem<int>(Translation.Translate("Mouse Camera Sensitivity"), senslist)
@@ -357,6 +390,7 @@ namespace MapEditor
             _settingsMenu.Add(language);
             _settingsMenu.Add(gamepadItem);
             _settingsMenu.Add(drawDistanceItem);
+            _settingsMenu.Add(streamingItem);
             _settingsMenu.Add(autosaveItem);
             _settingsMenu.Add(checkem);
             _settingsMenu.Add(boundItem);
@@ -1202,27 +1236,46 @@ namespace MapEditor
         public void AddItemToEntityMenu(Entity ent)
         {
             if (ent == null) return;
-            var name = "";
-            var type = "";
-            if (ent is Prop)
-            {
-                name = ObjectDatabase.MainDb.ContainsValue(ent.Model.Hash) ? ObjectDatabase.MainDb.First(pair => pair.Value == ent.Model.Hash).Key : "Unknown Prop";
-                type = "~h~[PROP]~h~ ";
-            }
-            else if (ent is Vehicle)
-            {
-                name = ObjectDatabase.VehicleDb.ContainsValue(ent.Model.Hash) ? ObjectDatabase.VehicleDb.First(x => x.Value == ent.Model.Hash).Key.ToUpper() : "Unknown Vehicle";
-                type = "~h~[VEH]~h~ ";
-            }
-            else if (ent is Ped)
-            {
-                name = ObjectDatabase.PedDb.ContainsValue(ent.Model.Hash) ? ObjectDatabase.PedDb.First(x => x.Value == ent.Model.Hash).Key.ToUpper() : "Unknown Ped";
-                type = "~h~[PED]~h~ ";
-            }
-            _currentObjectsMenu.Add(new NativeItem(type + name)
+
+            var type = ent is Vehicle ? ObjectTypes.Vehicle : ent is Ped ? ObjectTypes.Ped : ObjectTypes.Prop;
+            _currentObjectsMenu.Add(new NativeItem(EntityMenuTitle(type, ent.Model.Hash))
             {
                 Tag = new EntityMenuTag { Kind = EntityMenuKind.Entity, Id = ent.Handle },
             });
+        }
+
+        /// <summary>
+        /// The row for an object of the map that is not in the world at the moment, loaded from a file with the
+        /// player nowhere near it. It reads exactly like the row it will be once it has been walked up to; the
+        /// player has no reason to care which of the two it is, and activating it puts it back either way.
+        /// </summary>
+        public void AddStreamedItemToEntityMenu(MapObject o, int uid)
+        {
+            if (o == null) return;
+
+            _currentObjectsMenu.Add(new NativeItem(EntityMenuTitle(o.Type, o.Hash))
+            {
+                Tag = new EntityMenuTag { Kind = EntityMenuKind.Streamed, Id = uid },
+            });
+        }
+
+        private static string EntityMenuTitle(ObjectTypes type, int hash)
+        {
+            switch (type)
+            {
+                case ObjectTypes.Vehicle:
+                    return "~h~[VEH]~h~ " + (ObjectDatabase.VehicleDb.ContainsValue(hash)
+                        ? ObjectDatabase.VehicleDb.First(x => x.Value == hash).Key.ToUpper()
+                        : "Unknown Vehicle");
+                case ObjectTypes.Ped:
+                    return "~h~[PED]~h~ " + (ObjectDatabase.PedDb.ContainsValue(hash)
+                        ? ObjectDatabase.PedDb.First(x => x.Value == hash).Key.ToUpper()
+                        : "Unknown Ped");
+                default:
+                    return "~h~[PROP]~h~ " + (ObjectDatabase.MainDb.ContainsValue(hash)
+                        ? ObjectDatabase.MainDb.First(pair => pair.Value == hash).Key
+                        : "Unknown Prop");
+            }
         }
 
         private void RemoveFromEntityMenu(Func<EntityMenuTag, bool> predicate)
@@ -1304,22 +1357,42 @@ namespace MapEditor
                     SetMenuVisible(_objectInfoMenu, true);
                     return;
                 }
+                case EntityMenuKind.Streamed:
+                {
+                    // Picked from the list rather than flown to, so it is somewhere the player is not and is
+                    // not standing anywhere at the moment. It goes back into the world here and is then no
+                    // different from any other row; holding it as the selected entity is what keeps it there
+                    // while the player works on it, however far away that is.
+                    var record = PropStreamer.StreamedOut.FirstOrDefault(s => s.Uid == tag.Id);
+                    if (record == null) return;
+
+                    var restored = StreamInNow(record);
+                    if (restored == null) return;
+
+                    SelectFromEntityMenu(restored);
+                    return;
+                }
                 default:
                 {
                     var prop = Compat.Ent(tag.Id);
                     if (prop == null || !prop.Exists()) return;
-                    if (_settings.SnapCameraToSelectedObject)
-                    {
-                        _mainCamera.Position = prop.Position + new Vector3(5f, 5f, 10f);
-                        _mainCamera.PointAt(prop, Vector3.Zero);
-                    }
-                    CloseAllMenus();
-                    _selectedProp = prop;
-                    RedrawObjectInfoMenu(_selectedProp, true);
-                    SetMenuVisible(_objectInfoMenu, true);
+                    SelectFromEntityMenu(prop);
                     return;
                 }
             }
+        }
+
+        private void SelectFromEntityMenu(Entity entity)
+        {
+            if (_settings.SnapCameraToSelectedObject)
+            {
+                _mainCamera.Position = entity.Position + new Vector3(5f, 5f, 10f);
+                _mainCamera.PointAt(entity, Vector3.Zero);
+            }
+            CloseAllMenus();
+            _selectedProp = entity;
+            RedrawObjectInfoMenu(_selectedProp, true);
+            SetMenuVisible(_objectInfoMenu, true);
         }
     }
 }
